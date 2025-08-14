@@ -1,0 +1,10 @@
+python-telegram-bot[job-queue]==20.8
+python-dotenv
+httpx
+psutil
+playwright
+playwright-stealth
+requests
+beautifulsoup4
+tzdata
+cachetools

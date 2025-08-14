@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Bot runtime artifacts
+bot_data.pickle
+bot.lock
+
+# Caches & logs
+.cache/
+*.log
+pytest_cache/
+
+# Playwright
+playwright/.cache/
+
+# Editors/IDE
+.vscode/
+.idea/
+.cursor/ 
