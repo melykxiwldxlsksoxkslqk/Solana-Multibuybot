@@ -40,11 +40,9 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
     except Exception:
         runtime_tasks = {}
 
-    # Если задач реально нет, но остался старый флаг в user_data — очищаем
-    if not runtime_tasks and context.user_data.get('tracking_tasks'):
-        context.user_data['tracking_tasks'] = {}
-
-    is_tracking = bool(runtime_tasks)
+    # Определяем состояние трекинга: либо реальные задачи, либо флаг UI (который ставим сразу при старте)
+    user_flag = bool(context.user_data.get('tracking_tasks'))
+    is_tracking = bool(runtime_tasks) or user_flag
     
     keyboard = [
         [InlineKeyboardButton("Add Wallet Manually", callback_data='add_wallet')],
@@ -223,21 +221,26 @@ async def start_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stop_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = str(query.message.chat_id)
-    
-    # --- FIX for Race Condition ---
-    # 1. Immediately clear the tasks to change the state.
-    # This ensures the UI update will see the new state.
-    if 'tracking_tasks' in context.user_data:
-        # Create a task to do the cleanup in the background
-        context.application.create_task(stop_multibuy_tracker(chat_id, context))
-        # But remove it from the state dictionary immediately for the UI
-        del context.user_data['tracking_tasks']
-
-    # 2. Update the menu IMMEDIATELY with the new state.
-    await show_main_menu(update, context, message="🛑 Tracker stopped.")
+	query = update.callback_query
+	await query.answer()
+	chat_id = str(query.message.chat_id)
+	
+	# Запускаем остановку в фоне, UI обновим сразу
+	context.application.create_task(stop_multibuy_tracker(chat_id, context))
+	# Не удаляем user_data['tracking_tasks'] преждевременно, чтобы кнопка не "скакала"
+	await show_main_menu(update, context, message="🛑 Tracker stopping...")
+	
+	# Дождаться фактической остановки и обновить меню на Start
+	async def _await_stop_and_refresh():
+		for _ in range(40):  # ~20 секунд ожидания
+			runtime_tasks = getattr(context.application, "_runtime_tracking_tasks", {}).get(chat_id, {})
+			if not runtime_tasks and not context.user_data.get('tracking_tasks'):
+				await show_main_menu(update, context, message="🛑 Tracker stopped.")
+				return
+			await asyncio.sleep(0.5)
+		# Таймаут: всё равно попробовать перерисовать
+		await show_main_menu(update, context, message="🛑 Tracker stopped.")
+	context.application.create_task(_await_stop_and_refresh())
 
 async def load_kols_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
