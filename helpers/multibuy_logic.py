@@ -151,14 +151,41 @@ last_signatures = {} # Store last seen signature per wallet
 
 # --- Notification Functions (remains the same) ---
 async def send_discord_message(message):
-    if not DISCORD_WEBHOOK_URL: return
-    try:
-        async with httpx.AsyncClient() as client:
-            discord_message = message.replace('\\_', '_').replace('\\*', '*')
-            await client.post(DISCORD_WEBHOOK_URL, json={"content": discord_message})
-        logger.info("Discord notification sent.")
-    except Exception as e:
-        logger.error(f"Failed to send Discord message: {e}")
+	if not DISCORD_WEBHOOK_URL: return
+	try:
+		async with httpx.AsyncClient() as client:
+			# Basic sanitization for Discord
+			discord_message = (
+				str(message)
+				.replace('\n\n', '\n')
+				.replace('<b>', '**').replace('</b>', '**')
+				.replace('<i>', '*').replace('</i>', '*')
+				.replace('<code>', '`').replace('</code>', '`')
+				.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+			)
+			# Try to build a simple embed: title on first line, rest as description
+			lines = [l for l in discord_message.split('\n') if l.strip()]
+			title = lines[0][:256] if lines else "Multi Event"
+			description = "\n".join(lines[1:])[:4000] if len(lines) > 1 else None
+			payload = {
+				"embeds": [
+					{
+						"title": title,
+						"description": description or '',
+						"color": 0x00C853 if 'Buy' in title or '🔥' in title else 0xD50000,
+					}
+				]
+			}
+			# Fallback to content if embeds not allowed
+			try:
+				resp = await client.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+				if resp.status_code >= 400:
+					await client.post(DISCORD_WEBHOOK_URL, json={"content": discord_message}, timeout=10)
+			except Exception:
+				await client.post(DISCORD_WEBHOOK_URL, json={"content": discord_message}, timeout=10)
+		logger.info("Discord notification sent.")
+	except Exception as e:
+		logger.error(f"Failed to send Discord message: {e}")
 
 
 # Helper to format window label nicely (supports seconds/minutes)
