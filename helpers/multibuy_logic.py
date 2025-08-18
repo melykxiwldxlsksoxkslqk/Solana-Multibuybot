@@ -65,6 +65,10 @@ SOL_PRICE_TTL_SECONDS = int(os.getenv("SOL_PRICE_TTL_SECONDS", "60"))
 _sol_price_cache = {"price": 0.0, "ts": 0.0}
 # Optional Birdeye API key to avoid 401 responses on some endpoints
 BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
+# Discord forwarding controls
+DISCORD_ALLOWED_CHAT_IDS = {s.strip() for s in os.getenv("DISCORD_ALLOWED_CHAT_IDS", "").split(',') if s.strip()}
+DISCORD_DEDUPE_TTL_SECONDS = int(os.getenv("DISCORD_DEDUPE_TTL_SECONDS", "60"))
+_discord_dedupe: dict[str, float] = {}
 
 # (Удалено) Ранее были флаги SHOW_TOTAL_STATS / SHOW_RECENT_EXITS — больше не используются
 # Они убраны из кода, чтобы сообщение было короче и стабильнее.
@@ -150,8 +154,26 @@ notified_events = {}
 last_signatures = {} # Store last seen signature per wallet
 
 # --- Notification Functions (remains the same) ---
-async def send_discord_message(message):
+async def send_discord_message(message, chat_id: str | int = None, dedupe_key: str | None = None):
 	if not DISCORD_WEBHOOK_URL: return
+	# Filter by allowed chat ids if set
+	try:
+		if DISCORD_ALLOWED_CHAT_IDS:
+			cid = str(chat_id) if chat_id is not None else None
+			if cid is None or cid not in DISCORD_ALLOWED_CHAT_IDS:
+				return
+	except Exception:
+		pass
+	# Dedupe
+	try:
+		if dedupe_key:
+			now = perf_counter()
+			ts = _discord_dedupe.get(dedupe_key)
+			if ts and (now - ts) < max(1, DISCORD_DEDUPE_TTL_SECONDS):
+				return
+			_discord_dedupe[dedupe_key] = now
+	except Exception:
+		pass
 	try:
 		async with httpx.AsyncClient() as client:
 			# Basic sanitization for Discord
@@ -267,27 +289,32 @@ def format_notification(event_type: str, token_info: dict, participants: list, w
     return "\n".join([l for l in lines if l is not None and l != ""]) 
 
 async def send_notification(context: ContextTypes.DEFAULT_TYPE, message, chat_id: str):
-    # Приведение chat_id к int, если это строка из цифр
-    try:
-        chat_id_cast = int(chat_id) if isinstance(chat_id, str) and chat_id.isdigit() else chat_id
-    except Exception:
-        chat_id_cast = chat_id
-    try:
-        await context.bot.send_message(chat_id=chat_id_cast, text=message, parse_mode='HTML', disable_web_page_preview=True)
-        logger.info(f"Telegram notification sent to chat_id: {chat_id_cast} (HTML)")
-    except Exception as e:
-        logger.warning(f"HTML send failed, retrying MarkdownV2. Err: {e}")
-        try:
-            await context.bot.send_message(chat_id=chat_id_cast, text=message, parse_mode='MarkdownV2')
-            logger.info(f"Telegram notification (MarkdownV2) sent to chat_id: {chat_id_cast}")
-        except Exception as e2:
-            logger.warning(f"MarkdownV2 failed, retrying plain text. Err: {e2}")
-            try:
-                await context.bot.send_message(chat_id=chat_id_cast, text=message)
-                logger.info(f"Telegram notification (plain) sent to chat_id: {chat_id_cast}")
-            except Exception as e3:
-                logger.error(f"Failed to send Telegram message to {chat_id_cast}: {e3}")
-    await send_discord_message(message)
+	# Приведение chat_id к int, если это строка из цифр
+	try:
+		chat_id_cast = int(chat_id) if isinstance(chat_id, str) and chat_id.isdigit() else chat_id
+	except Exception:
+		chat_id_cast = chat_id
+	try:
+		await context.bot.send_message(chat_id=chat_id_cast, text=message, parse_mode='HTML', disable_web_page_preview=True)
+		logger.info(f"Telegram notification sent to chat_id: {chat_id_cast} (HTML)")
+	except Exception as e:
+		logger.warning(f"HTML send failed, retrying MarkdownV2. Err: {e}")
+		try:
+			await context.bot.send_message(chat_id=chat_id_cast, text=message, parse_mode='MarkdownV2')
+			logger.info(f"Telegram notification (MarkdownV2) sent to chat_id: {chat_id_cast}")
+		except Exception as e2:
+			logger.warning(f"MarkdownV2 failed, retrying plain text. Err: {e2}")
+			try:
+				await context.bot.send_message(chat_id=chat_id_cast, text=message)
+				logger.info(f"Telegram notification (plain) sent to chat_id: {chat_id_cast}")
+			except Exception as e3:
+				logger.error(f"Failed to send Telegram message to {chat_id_cast}: {e3}")
+	# Discord forward with dedupe
+	try:
+		key = f"{chat_id}|" + (message.split('\n',1)[0] if isinstance(message, str) else "")
+		await send_discord_message(message, chat_id=str(chat_id_cast), dedupe_key=key)
+	except Exception:
+		pass
 
 # --- Data Fetching & Analysis ---
 async def get_token_info(token_address):
