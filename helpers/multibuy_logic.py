@@ -12,6 +12,7 @@ import importlib.util
 from html import escape as html_escape
 from time import perf_counter
 from math import ceil
+import re
 
 # Попытка подключить готовые функции из SolanaTrackerBot (не копируя код)
 ST_WALLET_TRACKER = None
@@ -176,25 +177,34 @@ async def send_discord_message(message, chat_id: str | int = None, dedupe_key: s
 		pass
 	try:
 		async with httpx.AsyncClient() as client:
-			# Basic sanitization for Discord
+			# Convert HTML-ish to Discord-friendly text
+			raw = str(message)
+			# Replace anchor tags with "Text: URL"
+			raw = re.sub(r'<a\s+href=\"([^\"]+)\">([^<]+)</a>', r'\2: \1', raw)
+			# Basic sanitization
 			discord_message = (
-				str(message)
+				raw
 				.replace('\n\n', '\n')
 				.replace('<b>', '**').replace('</b>', '**')
 				.replace('<i>', '*').replace('</i>', '*')
 				.replace('<code>', '`').replace('</code>', '`')
 				.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
 			)
-			# Try to build a simple embed: title on first line, rest as description
 			lines = [l for l in discord_message.split('\n') if l.strip()]
 			title = lines[0][:256] if lines else "Multi Event"
-			description = "\n".join(lines[1:])[:4000] if len(lines) > 1 else None
+			description = "\n".join(lines[1:])[:4000] if len(lines) > 1 else ''
+			# Try to set embed.url to Dexscreener link
+			dex_url = None
+			m = re.search(r'https?://[^\s]*dexscreener\.com/\S+', discord_message)
+			if m:
+				dex_url = m.group(0)
 			payload = {
 				"embeds": [
 					{
 						"title": title,
-						"description": description or '',
-						"color": 0x00C853 if 'Buy' in title or '🔥' in title else 0xD50000,
+						"description": description,
+						"color": 0x00C853 if ('Buy' in title or '🔥' in title) else 0xD50000,
+						**({"url": dex_url} if dex_url else {})
 					}
 				]
 			}
