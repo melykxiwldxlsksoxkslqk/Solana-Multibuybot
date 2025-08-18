@@ -255,23 +255,32 @@ async def _background_load_kols(chat_id: int, context: ContextTypes.DEFAULT_TYPE
             await context.bot.send_message(chat_id, "🚨 Could not fetch wallets from kolscan.io.")
             return
         
-        # SMART STRICT SYNC: полностью заменяем список, но сохраняем is_tracking для совпадающих адресов
-        prev_wallets = context.user_data.get('wallets', []) or []
-        prev_tracking = {w.get('address'): w.get('is_tracking', False) for w in prev_wallets}
-        new_wallets = []
-        for w in kols_wallets:
-            addr = w.get('address')
-            if not addr:
-                continue
-            new_wallets.append({
-                'name': w.get('name', addr),
-                'address': addr,
-                'is_tracking': prev_tracking.get(addr, False)
-            })
-        context.user_data['wallets'] = new_wallets
-        total_count = len(new_wallets)
+        # SMART MERGE SYNC: объединяем новый список с закреплёнными трекаемыми адресами
+        async with KOL_REFRESH_LOCK:
+            prev_wallets = context.user_data.get('wallets', []) or []
+            prev_by_addr = {w.get('address'): {'is_tracking': w.get('is_tracking', False), 'name': w.get('name', w.get('address'))} for w in prev_wallets if w.get('address')}
+            fresh = [w for w in kols_wallets if w.get('address')]
+            new_wallets = []
+            used = set()
+            for w in fresh:
+                addr = w['address']
+                name = w.get('name', addr)
+                # prefer previous custom name if existed
+                if addr in prev_by_addr and prev_by_addr[addr].get('name'):
+                    name = prev_by_addr[addr]['name']
+                is_tr = prev_by_addr.get(addr, {}).get('is_tracking', False)
+                new_wallets.append({'name': name, 'address': addr, 'is_tracking': is_tr})
+                used.add(addr)
+            # keep pinned tracked wallets not present in fresh
+            kept = 0
+            for addr, meta in prev_by_addr.items():
+                if meta.get('is_tracking') and addr not in used:
+                    new_wallets.append({'name': meta.get('name', addr), 'address': addr, 'is_tracking': True})
+                    kept += 1
+            context.user_data['wallets'] = new_wallets
+            total_count = len(new_wallets)
         
-        await context.bot.send_message(chat_id, f"✅ Synced wallets from kolscan.io. Total: {total_count}. Tracked preserved where possible.")
+        await context.bot.send_message(chat_id, f"✅ Synced wallets from kolscan.io. Total: {total_count}. Kept pinned: {kept}.")
         # No manual save needed
         await view_wallets(None, context, page=0, chat_id_override=chat_id)
 
@@ -324,28 +333,34 @@ async def auto_refresh_kols_for_all_users(context: ContextTypes.DEFAULT_TYPE):
             for user_id, udata in list(context.application.user_data.items()):
                 try:
                     prev_wallets = udata.get('wallets', []) or []
-                    prev_tracking = {w.get('address'): w.get('is_tracking', False) for w in prev_wallets}
+                    prev_by_addr = {w.get('address'): {'is_tracking': w.get('is_tracking', False), 'name': w.get('name', w.get('address'))} for w in prev_wallets if w.get('address')}
                     new_wallets = []
+                    used = set()
                     for w in fresh:
-                        addr = w.get('address')
-                        new_wallets.append({
-                            'name': w.get('name', addr),
-                            'address': addr,
-                            'is_tracking': prev_tracking.get(addr, False)
-                        })
+                        addr = w['address']
+                        name = w.get('name', addr)
+                        if addr in prev_by_addr and prev_by_addr[addr].get('name'):
+                            name = prev_by_addr[addr]['name']
+                        is_tr = prev_by_addr.get(addr, {}).get('is_tracking', False)
+                        new_wallets.append({'name': name, 'address': addr, 'is_tracking': is_tr})
+                        used.add(addr)
+                    # keep pinned tracked wallets not present in fresh
+                    for addr, meta in prev_by_addr.items():
+                        if meta.get('is_tracking') and addr not in used:
+                            new_wallets.append({'name': meta.get('name', addr), 'address': addr, 'is_tracking': True})
                     udata['wallets'] = new_wallets
                     total_users += 1
                     # Уведомим
                     try:
-                        await context.bot.send_message(chat_id=int(user_id), text=f"🔄 Авто‑синхронизация KOL: {len(new_wallets)} кошельков. Отметки трекинга сохранены для совпадающих адресов.")
+                        await context.bot.send_message(chat_id=int(user_id), text=f"🔄 Авто‑синхронизация KOL: {len(new_wallets)} кошельков. Отметки трекинга сохранены; закреплённые адреса сохранены.")
                     except Exception:
                         try:
-                            await context.bot.send_message(chat_id=user_id, text=f"🔄 Авто‑синхронизация KOL: {len(new_wallets)} кошельков. Отметки трекинга сохранены для совпадающих адресов.")
+                            await context.bot.send_message(chat_id=user_id, text=f"🔄 Авто‑синхронизация KOL: {len(new_wallets)} кошельков. Отметки трекинга сохранены; закреплённые адреса сохранены.")
                         except Exception as e:
                             logger.warning(f"Failed to notify user {user_id} about smart KOL sync: {e}")
                 except Exception as e:
                     logger.warning(f"Auto-refresh smart sync failed for user {user_id}: {e}", exc_info=True)
-            logger.info(f"Auto-refresh KOL smart sync complete. Users updated: {total_users}.")
+            logger.info(f"Auto-refresh KOL smart merge complete. Users updated: {total_users}.")
 
             # Зафиксируем момент успешного авто‑обновления для восстановления таймера после рестарта
             try:
