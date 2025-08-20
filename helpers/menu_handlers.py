@@ -330,6 +330,7 @@ async def auto_refresh_kols_for_all_users(context: ContextTypes.DEFAULT_TYPE):
             # Новый список из Kolscan
             fresh = [w for w in kols_wallets if w.get('address')]
             total_users = 0
+            notify = os.getenv("KOL_AUTO_REFRESH_NOTIFY", "0") == "1"
             for user_id, udata in list(context.application.user_data.items()):
                 try:
                     prev_wallets = udata.get('wallets', []) or []
@@ -350,14 +351,22 @@ async def auto_refresh_kols_for_all_users(context: ContextTypes.DEFAULT_TYPE):
                             new_wallets.append({'name': meta.get('name', addr), 'address': addr, 'is_tracking': True})
                     udata['wallets'] = new_wallets
                     total_users += 1
-                    # Уведомим
-                    try:
-                        await context.bot.send_message(chat_id=int(user_id), text=f"🔄 Авто‑синхронизация KOL: {len(new_wallets)} кошельков. Отметки трекинга сохранены; закреплённые адреса сохранены.")
-                    except Exception:
+                    # Авто‑уведомление (по умолчанию выключено)
+                    if notify:
                         try:
-                            await context.bot.send_message(chat_id=user_id, text=f"🔄 Авто‑синхронизация KOL: {len(new_wallets)} кошельков. Отметки трекинга сохранены; закреплённые адреса сохранены.")
-                        except Exception as e:
-                            logger.warning(f"Failed to notify user {user_id} about smart KOL sync: {e}")
+                            await context.bot.send_message(chat_id=int(user_id), text=f"🔄 Авто‑синхронизация KOL: {len(new_wallets)} кошельков. Отметки трекинга сохранены; закреплённые адреса сохранены.")
+                        except Exception:
+                            try:
+                                await context.bot.send_message(chat_id=user_id, text=f"🔄 Авто‑синхронизация KOL: {len(new_wallets)} кошельков. Отметки трекинга сохранены; закреплённые адреса сохранены.")
+                            except Exception as e:
+                                logger.warning(f"Failed to notify user {user_id} about smart KOL sync: {e}")
+                    # Гарантируем, что трекер активен для чата, где был запущен трекинг
+                    try:
+                        had_tracking = bool(udata.get('tracking_tasks'))
+                        if had_tracking:
+                            context.application.create_task(start_multibuy_tracker(str(user_id), context.application))
+                    except Exception as e:
+                        logger.warning(f"Failed to reassert tracker for chat {user_id}: {e}")
                 except Exception as e:
                     logger.warning(f"Auto-refresh smart sync failed for user {user_id}: {e}", exc_info=True)
             logger.info(f"Auto-refresh KOL smart merge complete. Users updated: {total_users}.")
