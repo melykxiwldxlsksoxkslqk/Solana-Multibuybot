@@ -25,11 +25,19 @@ from helpers.menu_handlers import (
     auto_refresh_kols_for_all_users,
 )
 
-# Enable logging
+# Enable logging (configurable)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING").upper()
+_level = getattr(logging, LOG_LEVEL, logging.WARNING)
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=_level
 )
+# Quiet noisy libraries
+for noisy in ("httpx", "aiohttp", "urllib3", "playwright", "telegram", "telegram.ext", "asyncio"):
+    try:
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    except Exception:
+        pass
 
 async def main() -> None:
     """Start the bot."""
