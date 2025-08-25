@@ -62,8 +62,8 @@ PREALERT_THRESHOLD = int(os.getenv("PREALERT_THRESHOLD", "2"))
 # Управление отправкой UPDATE-сообщений
 ENABLE_UPDATES = os.getenv("ENABLE_UPDATES", "1") == "1"
 DEX_TTL_SECONDS = int(os.getenv("DEX_TTL_SECONDS", "60"))
-# Deprecated: we do not sleep on rate limit anymore
-RATE_LIMIT_SLEEP_SECONDS = 0.0
+
+
 # NEW: SOL price cache TTL and cache
 SOL_PRICE_TTL_SECONDS = int(os.getenv("SOL_PRICE_TTL_SECONDS", "60"))
 _sol_price_cache = {"price": 0.0, "ts": 0.0}
@@ -943,32 +943,108 @@ async def sequential_tracker(chat_id: str, application):
                                                     except Exception:
                                                         sol_change = 0.0
                                                 event_time = datetime.fromtimestamp(tx_data.get('blockTime'), tz=timezone.utc)
-                                                if sol_change < -0.001:
-                                                    for token_addr, change in changes.items():
-                                                        if change > 0 and token_addr not in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
-                                                            recent_events.setdefault(token_addr, {"buys": [], "sells": []})
-                                                            if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['buys']):
-                                                                try:
-                                                                    token_info_snapshot = await get_token_info(token_addr)
-                                                                    cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
-                                                                except Exception:
-                                                                    cap_snapshot = None
-                                                                recent_events[token_addr]['buys'].append({"wallet": wallet_address, "amount": abs(sol_change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
-                                                elif sol_change > 0.001:
-                                                    for token_addr, change in changes.items():
-                                                        if change < 0 and token_addr not in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
-                                                            recent_events.setdefault(token_addr, {"buys": [], "sells": []})
-                                                            if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['sells']):
-                                                                try:
-                                                                    token_info_snapshot = await get_token_info(token_addr)
-                                                                    cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
-                                                                except Exception:
-                                                                    cap_snapshot = None
-                                                                recent_events[token_addr]['sells'].append({"wallet": wallet_address, "amount": sol_change, "time": event_time, "name": wallet_name, "cap": cap_snapshot})
+                                                # фильтр по давности
+                                                if datetime.now(timezone.utc) - event_time > timedelta(minutes=MAX_LOOKBACK_MINUTES):
+                                                    continue
+                                                # Классификация по изменению токен-баланса (игнорируем SOL-дельту)
+                                                for token_addr, change in changes.items():
+                                                    if token_addr in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
+                                                        continue
+                                                    if change > 0:
+                                                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                                                        if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['buys']):
+                                                            try:
+                                                                token_info_snapshot = await get_token_info(token_addr)
+                                                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                                            except Exception:
+                                                                cap_snapshot = None
+                                                            recent_events[token_addr]['buys'].append({"wallet": wallet_address, "amount": abs(sol_change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
+                                                    elif change < 0:
+                                                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                                                        if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['sells']):
+                                                            try:
+                                                                token_info_snapshot = await get_token_info(token_addr)
+                                                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                                            except Exception:
+                                                                cap_snapshot = None
+                                                            recent_events[token_addr]['sells'].append({"wallet": wallet_address, "amount": sol_change, "time": event_time, "name": wallet_name, "cap": cap_snapshot})
                                             except Exception:
                                                 pass
-                                    # Зафиксировать текущее состояние как "последнее"
-                                    last_sigs_by_wallet[wallet_address] = current_signatures
+                                else:
+                                    # Холодный старт без бэкфилла: обработаем хотя бы 1 последнюю сигнатуру
+                                    new_signatures = current_signatures[:1]
+                                    if new_signatures:
+                                        logger.info(f"Backfill 1 tx (coldstart) for {wallet_name}.")
+                                        for signature in reversed(new_signatures):
+                                            tx_payload = {
+                                                "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+                                                "params": [signature, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}]
+                                            }
+                                            tx_data = None
+                                            if ST_WALLET_TRACKER is not None:
+                                                try:
+                                                    details = await ST_WALLET_TRACKER.get_transaction_details(signature)  # type: ignore
+                                                    if isinstance(details, dict):
+                                                        tx_data = details.get('result')
+                                                except Exception as e:
+                                                    logger.warning(f"ST_WALLET_TRACKER.get_transaction_details(backfill) failed: {e}")
+                                            if tx_data is None:
+                                                tx_response = await rpc_post(client, tx_payload, timeout=30.0)
+                                                if tx_response.status_code == 429:
+                                                    logger.warning(f"Rate limited on getTransaction(backfill) for {wallet_name}, skip sleep.")
+                                                    continue
+                                                tx_data = tx_response.json().get('result')
+                                            if not tx_data:
+                                                continue
+                                            try:
+                                                pre_balances = tx_data.get("meta", {}).get("preTokenBalances", [])
+                                                post_balances = tx_data.get("meta", {}).get("postTokenBalances", [])
+                                                changes = {}
+                                                for balance in pre_balances:
+                                                    if balance.get('owner') == wallet_address:
+                                                        addr = balance.get('mint')
+                                                        changes[addr] = changes.get(addr, 0) - _to_float_token_amount(balance.get('uiTokenAmount'))
+                                                for balance in post_balances:
+                                                    if balance.get('owner') == wallet_address:
+                                                        addr = balance.get('mint')
+                                                        changes[addr] = changes.get(addr, 0) + _to_float_token_amount(balance.get('uiTokenAmount'))
+                                                meta = tx_data.get('meta', {})
+                                                account_keys = tx_data.get('transaction', {}).get('message', {}).get('accountKeys', [])
+                                                pubkeys = [k.get('pubkey') if isinstance(k, dict) else k for k in account_keys]
+                                                sol_change = 0.0
+                                                if pubkeys and wallet_address in pubkeys:
+                                                    idx = pubkeys.index(wallet_address)
+                                                    try:
+                                                        sol_change = (meta.get('postBalances', [0]*len(pubkeys))[idx] - meta.get('preBalances', [0]*len(pubkeys))[idx]) / 1e9
+                                                    except Exception:
+                                                        sol_change = 0.0
+                                                event_time = datetime.fromtimestamp(tx_data.get('blockTime'), tz=timezone.utc)
+                                                if datetime.now(timezone.utc) - event_time > timedelta(minutes=MAX_LOOKBACK_MINUTES):
+                                                    continue
+                                                for token_addr, change in changes.items():
+                                                    if token_addr in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
+                                                        continue
+                                                    if change > 0:
+                                                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                                                        if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['buys']):
+                                                            try:
+                                                                token_info_snapshot = await get_token_info(token_addr)
+                                                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                                            except Exception:
+                                                                cap_snapshot = None
+                                                            recent_events[token_addr]['buys'].append({"wallet": wallet_address, "amount": abs(sol_change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
+                                                    elif change < 0:
+                                                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                                                        if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['sells']):
+                                                            try:
+                                                                token_info_snapshot = await get_token_info(token_addr)
+                                                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                                            except Exception:
+                                                                cap_snapshot = None
+                                                            recent_events[token_addr]['sells'].append({"wallet": wallet_address, "amount": sol_change, "time": event_time, "name": wallet_name, "cap": cap_snapshot})
+                                            except Exception:
+                                                pass
+                                
                             else:
                                 new_signatures = [sig for sig in current_signatures if sig not in last_seen_signatures]
                                 if new_signatures:
@@ -1021,6 +1097,9 @@ async def sequential_tracker(chat_id: str, application):
                                                 except Exception:
                                                     sol_change = 0.0
                                             event_time = datetime.fromtimestamp(tx_data.get('blockTime'), tz=timezone.utc)
+                                            # фильтр по давности
+                                            if datetime.now(timezone.utc) - event_time > timedelta(minutes=MAX_LOOKBACK_MINUTES):
+                                                continue
 
                                             # Simple per-tx feed (optional, like SolanaTrackerBot)
                                             if SIMPLE_TX_FEED:
@@ -1034,30 +1113,30 @@ async def sequential_tracker(chat_id: str, application):
                                                 except Exception as e:
                                                     logger.warning(f"Failed to send simple feed message: {e}")
 
-                                            if sol_change < -0.001: # Buy
-                                                for token_addr, change in changes.items():
-                                                    if change > 0 and token_addr not in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
-                                                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
-                                                        if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['buys']):
-                                                            logger.info(f"BUY EVENT: {wallet_name} bought {token_addr}")
-                                                            try:
-                                                                token_info_snapshot = await get_token_info(token_addr)
-                                                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
-                                                            except Exception:
-                                                                cap_snapshot = None
-                                                            recent_events[token_addr]['buys'].append({"wallet": wallet_address, "amount": abs(sol_change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
-                                            elif sol_change > 0.001: # Sell
-                                                for token_addr, change in changes.items():
-                                                    if change < 0 and token_addr not in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
-                                                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
-                                                        if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['sells']):
-                                                            logger.info(f"SELL EVENT: {wallet_name} sold {token_addr}")
-                                                            try:
-                                                                token_info_snapshot = await get_token_info(token_addr)
-                                                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
-                                                            except Exception:
-                                                                cap_snapshot = None
-                                                            recent_events[token_addr]['sells'].append({"wallet": wallet_address, "amount": sol_change, "time": event_time, "name": wallet_name, "cap": cap_snapshot})
+                                            # Классификация по изменению токен-баланса (игнорируем SOL-дельту)
+                                            for token_addr, change in changes.items():
+                                                if token_addr in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
+                                                    continue
+                                                if change > 0:
+                                                    recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                                                    if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['buys']):
+                                                        logger.info(f"BUY EVENT: {wallet_name} bought {token_addr}")
+                                                        try:
+                                                            token_info_snapshot = await get_token_info(token_addr)
+                                                            cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                                        except Exception:
+                                                            cap_snapshot = None
+                                                        recent_events[token_addr]['buys'].append({"wallet": wallet_address, "amount": abs(sol_change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
+                                                elif change < 0:
+                                                    recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                                                    if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['sells']):
+                                                        logger.info(f"SELL EVENT: {wallet_name} sold {token_addr}")
+                                                        try:
+                                                            token_info_snapshot = await get_token_info(token_addr)
+                                                            cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                                        except Exception:
+                                                            cap_snapshot = None
+                                                        recent_events[token_addr]['sells'].append({"wallet": wallet_address, "amount": sol_change, "time": event_time, "name": wallet_name, "cap": cap_snapshot})
                                         except Exception as e:
                                             logger.error(f"Error processing transaction {signature} for {wallet_name}: {e}", exc_info=True)
                                     last_sigs_by_wallet[wallet_address] = current_signatures
