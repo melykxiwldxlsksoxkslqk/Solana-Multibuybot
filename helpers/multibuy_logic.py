@@ -874,8 +874,7 @@ async def sequential_tracker(chat_id: str, application):
                                 response = await rpc_post(client, payload, timeout=30.0)
 
                             if response.status_code == 429:
-                                logger.warning(f"Rate limited on getSignatures for {wallet_name}, sleeping for {RATE_LIMIT_SLEEP_SECONDS}s.")
-                                await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
+                                logger.warning(f"Rate limited on getSignatures for {wallet_name}, skip sleep.")
                                 return
                             response.raise_for_status()
 
@@ -911,8 +910,7 @@ async def sequential_tracker(chat_id: str, application):
                                             if tx_data is None:
                                                 tx_response = await rpc_post(client, tx_payload, timeout=30.0)
                                                 if tx_response.status_code == 429:
-                                                    logger.warning(f"Rate limited on getTransaction(backfill) for {wallet_name}, sleeping for {RATE_LIMIT_SLEEP_SECONDS}s.")
-                                                    await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
+                                                    logger.warning(f"Rate limited on getTransaction(backfill) for {wallet_name}, skip sleep.")
                                                     continue
                                                 tx_data = tx_response.json().get('result')
                                             if not tx_data:
@@ -989,8 +987,7 @@ async def sequential_tracker(chat_id: str, application):
                                         if tx_data is None:
                                             tx_response = await rpc_post(client, tx_payload, timeout=30.0)
                                             if tx_response.status_code == 429:
-                                                logger.warning(f"Rate limited on getTransaction for {wallet_name}, sleeping for {RATE_LIMIT_SLEEP_SECONDS}s.")
-                                                await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
+                                                logger.warning(f"Rate limited on getTransaction for {wallet_name}, skip sleep.")
                                                 continue
                                             tx_data = tx_response.json().get('result')
                                         if not tx_data:
@@ -1062,7 +1059,12 @@ async def sequential_tracker(chat_id: str, application):
                                     last_sigs_by_wallet[wallet_address] = current_signatures
                     finally:
                         # small pause between wallets
-                        await asyncio.sleep(float(os.getenv("WALLET_SPACING_SECONDS", "0.1")))
+                        try:
+                            _spacing = float(os.getenv("WALLET_SPACING_SECONDS", "0"))
+                        except Exception:
+                            _spacing = 0.0
+                        if _spacing > 0:
+                            await asyncio.sleep(_spacing)
                         scanned_total += 1
                 
                 # Запускаем обработки пачкой с лимитом одновременности
