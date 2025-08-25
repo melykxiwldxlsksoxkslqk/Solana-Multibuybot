@@ -267,6 +267,10 @@ async def load_kols_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _background_load_kols(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
+        logger.info(f"Manual KOL sync started for chat_id={chat_id}")
+    except Exception:
+        pass
+    try:
         kols_wallets = await get_kolscan_wallets()
         if not kols_wallets:
             await context.bot.send_message(chat_id, "🚨 Could not fetch wallets from kolscan.io.")
