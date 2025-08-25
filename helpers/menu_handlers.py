@@ -262,7 +262,7 @@ async def stop_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def load_kols_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Request received. Fetching wallets in the background...")
-    await query.edit_message_text("⏳ Fetching KOL wallets... I'll send a new message when it's done.")
+    await query.edit_message_text("⏳ Загружаю KOL-кошельки... пришлю сообщение, когда закончу.")
     context.application.create_task(_background_load_kols(str(query.message.chat_id), context))
 
 async def _background_load_kols(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -302,7 +302,7 @@ async def _background_load_kols(chat_id: int, context: ContextTypes.DEFAULT_TYPE
             context.user_data['wallets'] = new_wallets
             total_count = len(new_wallets)
         
-        await context.bot.send_message(chat_id, f"✅ Synced wallets from kolscan.io. Total: {total_count}. Kept pinned: {kept}.")
+        await context.bot.send_message(chat_id, f"✅ Все кошельки собраны. Всего: {total_count}. Закреплённых сохранено: {kept}.")
         # No manual save needed
         await view_wallets(None, context, page=0, chat_id_override=chat_id)
 
