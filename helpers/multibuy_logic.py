@@ -62,7 +62,8 @@ PREALERT_THRESHOLD = int(os.getenv("PREALERT_THRESHOLD", "2"))
 # Управление отправкой UPDATE-сообщений
 ENABLE_UPDATES = os.getenv("ENABLE_UPDATES", "1") == "1"
 DEX_TTL_SECONDS = int(os.getenv("DEX_TTL_SECONDS", "60"))
-RATE_LIMIT_SLEEP_SECONDS = float(os.getenv("RATE_LIMIT_SLEEP_SECONDS", "5"))
+# Deprecated: we do not sleep on rate limit anymore
+RATE_LIMIT_SLEEP_SECONDS = 0.0
 # NEW: SOL price cache TTL and cache
 SOL_PRICE_TTL_SECONDS = int(os.getenv("SOL_PRICE_TTL_SECONDS", "60"))
 _sol_price_cache = {"price": 0.0, "ts": 0.0}
