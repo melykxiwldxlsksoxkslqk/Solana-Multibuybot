@@ -51,6 +51,20 @@ MIN_MARKET_CAP = int(os.getenv("MIN_MARKET_CAP", 75000))
 # Верхний порог капы (опционально). Не задан → не ограничиваем сверху
 MAX_MARKET_CAP = int(os.getenv("MAX_MARKET_CAP")) if os.getenv("MAX_MARKET_CAP") else None
 SOLANA_RPC_ENDPOINT = os.getenv("SOLANA_RPC_ENDPOINT", "https://api.mainnet-beta.solana.com")
+# Optional pool of RPC endpoints (comma-separated). If provided, we will round-robin across them.
+_RPC_ENDPOINTS_ENV = os.getenv("SOLANA_RPC_ENDPOINTS", "").strip()
+RPC_ENDPOINTS: list[str] = [e.strip() for e in _RPC_ENDPOINTS_ENV.split(",") if e.strip()] or [SOLANA_RPC_ENDPOINT]
+_RPC_IDX: int = 0
+
+def _next_rpc_endpoint() -> str:
+    global _RPC_IDX
+    try:
+        endpoint = RPC_ENDPOINTS[_RPC_IDX % len(RPC_ENDPOINTS)]
+        _RPC_IDX += 1
+        return endpoint
+    except Exception:
+        return SOLANA_RPC_ENDPOINT
+
 SIMPLE_TX_FEED = os.getenv("SIMPLE_TX_FEED", "0") == "1"  # Optional per-tx debug feed
 # Включение подробного дебага
 DEBUG_VERBOSE = os.getenv("DEBUG_VERBOSE", "0") == "1"
@@ -87,7 +101,7 @@ RECENT_EXITS_MAX = int(os.getenv("RECENT_EXITS_MAX", "3"))
 # Если модуль SolanaTrackerBot найден — используем его RPC URL
 if ST_WALLET_TRACKER is not None:
     try:
-        ST_WALLET_TRACKER.url = SOLANA_RPC_ENDPOINT
+        ST_WALLET_TRACKER.url = RPC_ENDPOINTS[0]
     except Exception:
         pass
 
@@ -148,11 +162,20 @@ RPC_JITTER_MAX = float(os.getenv("RPC_JITTER_MAX", "0.2"))
 
 async def rpc_post(client: httpx.AsyncClient, payload: dict, timeout: float = 30.0):
     async with RPC_SEMAPHORE:
-        response = await client.post(SOLANA_RPC_ENDPOINT, json=payload, timeout=timeout)
+        last_response = None
+        attempts = max(1, len(RPC_ENDPOINTS))
+        for i in range(attempts):
+            endpoint = _next_rpc_endpoint()
+            response = await client.post(endpoint, json=payload, timeout=timeout)
+            last_response = response
+            # If not 429 or it is the final attempt, break
+            if response.status_code != 429 or i == attempts - 1:
+                break
         # small pacing to be nice to public endpoints + jitter to avoid thundering herd
         delay = max(0.0, RPC_DELAY_SECONDS) + (random.uniform(0, RPC_JITTER_MAX) if RPC_JITTER_MAX > 0 else 0)
-        await asyncio.sleep(delay)
-        return response
+        if delay > 0:
+            await asyncio.sleep(delay)
+        return last_response
 
 # --- In-memory Stores ---
 recent_events = {}
