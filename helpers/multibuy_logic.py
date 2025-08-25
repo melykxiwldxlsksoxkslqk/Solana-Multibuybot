@@ -51,20 +51,6 @@ MIN_MARKET_CAP = int(os.getenv("MIN_MARKET_CAP", 75000))
 # Верхний порог капы (опционально). Не задан → не ограничиваем сверху
 MAX_MARKET_CAP = int(os.getenv("MAX_MARKET_CAP")) if os.getenv("MAX_MARKET_CAP") else None
 SOLANA_RPC_ENDPOINT = os.getenv("SOLANA_RPC_ENDPOINT", "https://api.mainnet-beta.solana.com")
-# Optional pool of RPC endpoints (comma-separated). If provided, we will round-robin across them.
-_RPC_ENDPOINTS_ENV = os.getenv("SOLANA_RPC_ENDPOINTS", "").strip()
-RPC_ENDPOINTS: list[str] = [e.strip() for e in _RPC_ENDPOINTS_ENV.split(",") if e.strip()] or [SOLANA_RPC_ENDPOINT]
-_RPC_IDX: int = 0
-
-def _next_rpc_endpoint() -> str:
-    global _RPC_IDX
-    try:
-        endpoint = RPC_ENDPOINTS[_RPC_IDX % len(RPC_ENDPOINTS)]
-        _RPC_IDX += 1
-        return endpoint
-    except Exception:
-        return SOLANA_RPC_ENDPOINT
-
 SIMPLE_TX_FEED = os.getenv("SIMPLE_TX_FEED", "0") == "1"  # Optional per-tx debug feed
 # Включение подробного дебага
 DEBUG_VERBOSE = os.getenv("DEBUG_VERBOSE", "0") == "1"
@@ -101,7 +87,7 @@ RECENT_EXITS_MAX = int(os.getenv("RECENT_EXITS_MAX", "3"))
 # Если модуль SolanaTrackerBot найден — используем его RPC URL
 if ST_WALLET_TRACKER is not None:
     try:
-        ST_WALLET_TRACKER.url = RPC_ENDPOINTS[0]
+        ST_WALLET_TRACKER.url = SOLANA_RPC_ENDPOINT
     except Exception:
         pass
 
@@ -162,20 +148,11 @@ RPC_JITTER_MAX = float(os.getenv("RPC_JITTER_MAX", "0.2"))
 
 async def rpc_post(client: httpx.AsyncClient, payload: dict, timeout: float = 30.0):
     async with RPC_SEMAPHORE:
-        last_response = None
-        attempts = max(1, len(RPC_ENDPOINTS))
-        for i in range(attempts):
-            endpoint = _next_rpc_endpoint()
-            response = await client.post(endpoint, json=payload, timeout=timeout)
-            last_response = response
-            # If not 429 or it is the final attempt, break
-            if response.status_code != 429 or i == attempts - 1:
-                break
+        response = await client.post(SOLANA_RPC_ENDPOINT, json=payload, timeout=timeout)
         # small pacing to be nice to public endpoints + jitter to avoid thundering herd
         delay = max(0.0, RPC_DELAY_SECONDS) + (random.uniform(0, RPC_JITTER_MAX) if RPC_JITTER_MAX > 0 else 0)
-        if delay > 0:
-            await asyncio.sleep(delay)
-        return last_response
+        await asyncio.sleep(delay)
+        return response
 
 # --- In-memory Stores ---
 recent_events = {}
@@ -268,7 +245,10 @@ def _format_window_label(window_seconds: int) -> str:
 
 def format_notification(event_type: str, token_info: dict, participants: list, window_minutes: int, is_update: bool = False, total_participants: list | None = None, recent_exits: list | None = None) -> str:
     is_buy = "Buy" in event_type
-    title = ("📈 <b>Multi-Buy UPDATE</b> 📈" if is_update else "🔥 <b>Multi-Buy Alert</b> 🔥") if is_buy else ("📉 <b>Multi-Sell UPDATE</b> 📉" if is_update else "🚨 <b>Multi-Sell Alert</b> 🚨")
+    if is_buy:
+        title = "📈 <b>Updates Multibuy Wallets</b> 📈" if is_update else "🔥 <b>Multi-Buy Alert</b> 🔥"
+    else:
+        title = "📉 <b>Updates Multisell Wallets</b> 📉" if is_update else "🚨 <b>Multi-Sell Alert</b> 🚨"
     participant_label = "Buyers" if is_buy else "Sellers"
 
     action_tag = "BUY" if is_buy else "SELL"
@@ -611,7 +591,8 @@ async def analyze_and_store_transactions(wallets_to_track):
                 
                 # Gently handle 429 errors by just skipping this cycle for this wallet
                 if response.status_code == 429:
-                    logger.warning(f"Rate limited for {wallet['name']}. Skipping this cycle (no sleep).")
+                    logger.warning(f"Rate limited for {wallet['name']}. Skipping this cycle.")
+                    await asyncio.sleep(2) # Extra wait time
                     continue
                 response.raise_for_status()
 
@@ -628,7 +609,8 @@ async def analyze_and_store_transactions(wallets_to_track):
                     }
                     response = await rpc_post(client, payload, timeout=20)
                     if response.status_code == 429:
-                        logger.warning(f"Rate limited (fallback) for {wallet['name']}. Skipping (no sleep).")
+                        logger.warning(f"Rate limited (fallback) for {wallet['name']}. Skipping.")
+                        await asyncio.sleep(2)
                         continue
                     response.raise_for_status()
                     body = response.json()
@@ -662,7 +644,8 @@ async def analyze_and_store_transactions(wallets_to_track):
                     tx_response = await rpc_post(client, tx_payload, timeout=20)
                     dlog(f"getTransaction status={tx_response.status_code} sig={latest_signature}")
                     if tx_response.status_code == 429:
-                        logger.warning(f"Rate limited getting tx details for {wallet['name']}. Skipping (no sleep).")
+                        logger.warning(f"Rate limited getting tx details for {wallet['name']}. Skipping.")
+                        await asyncio.sleep(2)
                         continue
                     tx_response.raise_for_status()
                     tx_data = tx_response.json().get('result')
@@ -695,37 +678,37 @@ async def analyze_and_store_transactions(wallets_to_track):
                 event_time = datetime.fromtimestamp(tx_data.get('blockTime'), tz=timezone.utc)
                 if datetime.now(timezone.utc) - event_time > timedelta(minutes=MAX_LOOKBACK_MINUTES):
                     continue
-                for token_addr, change in changes.items():
-                    if token_addr in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
-                        continue
-                    if change > 0:
-                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
-                        if not any(e['wallet'] == wallet['address'] for e in recent_events[token_addr]['buys']):
-                            logger.info(f"New BUY: {wallet['name']} bought {token_addr}")
-                            try:
-                                token_info_snapshot = await get_token_info(token_addr)
-                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
-                            except Exception:
-                                cap_snapshot = None
-                            recent_events[token_addr]['buys'].append({"wallet": wallet['address'], "amount": abs(change), "time": event_time, "name": wallet['name'], "cap": cap_snapshot})
-                    elif change < 0:
-                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
-                        if not any(e['wallet'] == wallet['address'] for e in recent_events[token_addr]['sells']):
-                            logger.info(f"New SELL: {wallet['name']} sold {token_addr}")
-                            try:
-                                token_info_snapshot = await get_token_info(token_addr)
-                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
-                            except Exception:
-                                cap_snapshot = None
-                            recent_events[token_addr]['sells'].append({"wallet": wallet['address'], "amount": abs(change), "time": event_time, "name": wallet['name'], "cap": cap_snapshot})
+                if sol_change < 0:
+                    for token_addr, change in changes.items():
+                        if change > 0 and token_addr != "So11111111111111111111111111111111111111112":
+                            recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                            if not any(e['wallet'] == wallet['address'] for e in recent_events[token_addr]['buys']):
+                                logger.info(f"New BUY: {wallet['name']} bought {token_addr}")
+                                # Снимок капы на момент события
+                                try:
+                                    token_info_snapshot = await get_token_info(token_addr)
+                                    cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                except Exception:
+                                    cap_snapshot = None
+                                recent_events[token_addr]['buys'].append({"wallet": wallet['address'], "amount": abs(sol_change), "time": event_time, "name": wallet['name'], "cap": cap_snapshot})
+                elif sol_change > 0:
+                    for token_addr, change in changes.items():
+                        if change < 0 and token_addr != "So11111111111111111111111111111111111111112":
+                            recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                            if not any(e['wallet'] == wallet['address'] for e in recent_events[token_addr]['sells']):
+                                logger.info(f"New SELL: {wallet['name']} sold {token_addr}")
+                                try:
+                                    token_info_snapshot = await get_token_info(token_addr)
+                                    cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                except Exception:
+                                    cap_snapshot = None
+                                recent_events[token_addr]['sells'].append({"wallet": wallet['address'], "amount": sol_change, "time": event_time, "name": wallet['name'], "cap": cap_snapshot})
             except httpx.HTTPStatusError as e:
                 logger.warning(f"HTTP error for {wallet['name']}: {e}") # Log as warning, don't crash
             except Exception as e:
                 logger.error(f"Error processing wallet {wallet['name']}: {e}", exc_info=True)
             
-            spacing = float(os.getenv("WALLET_SPACING_SECONDS", "0.0"))
-            if spacing > 0:
-                await asyncio.sleep(spacing)
+            await asyncio.sleep(1) # Small delay between each wallet to be respectful to the API
 
 async def clean_old_events():
     now = datetime.now(timezone.utc)
@@ -894,7 +877,8 @@ async def sequential_tracker(chat_id: str, application):
                                 response = await rpc_post(client, payload, timeout=30.0)
 
                             if response.status_code == 429:
-                                logger.warning(f"Rate limited on getSignatures for {wallet_name}, skip sleep.")
+                                logger.warning(f"Rate limited on getSignatures for {wallet_name}, sleeping for {RATE_LIMIT_SLEEP_SECONDS}s.")
+                                await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
                                 return
                             response.raise_for_status()
 
@@ -930,7 +914,8 @@ async def sequential_tracker(chat_id: str, application):
                                             if tx_data is None:
                                                 tx_response = await rpc_post(client, tx_payload, timeout=30.0)
                                                 if tx_response.status_code == 429:
-                                                    logger.warning(f"Rate limited on getTransaction(backfill) for {wallet_name}, skip sleep.")
+                                                    logger.warning(f"Rate limited on getTransaction(backfill) for {wallet_name}, sleeping for {RATE_LIMIT_SLEEP_SECONDS}s.")
+                                                    await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
                                                     continue
                                                 tx_data = tx_response.json().get('result')
                                             if not tx_data:
@@ -959,27 +944,28 @@ async def sequential_tracker(chat_id: str, application):
                                                     except Exception:
                                                         sol_change = 0.0
                                                 event_time = datetime.fromtimestamp(tx_data.get('blockTime'), tz=timezone.utc)
-                                                for token_addr, change in changes.items():
-                                                    if token_addr in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
-                                                        continue
-                                                    if change > 0:
-                                                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
-                                                        if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['buys']):
-                                                            try:
-                                                                token_info_snapshot = await get_token_info(token_addr)
-                                                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
-                                                            except Exception:
-                                                                cap_snapshot = None
-                                                            recent_events[token_addr]['buys'].append({"wallet": wallet_address, "amount": abs(change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
-                                                    elif change < 0:
-                                                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
-                                                        if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['sells']):
-                                                            try:
-                                                                token_info_snapshot = await get_token_info(token_addr)
-                                                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
-                                                            except Exception:
-                                                                cap_snapshot = None
-                                                            recent_events[token_addr]['sells'].append({"wallet": wallet_address, "amount": abs(change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
+                                                if sol_change < -0.001:
+                                                    for token_addr, change in changes.items():
+                                                        if change > 0 and token_addr not in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
+                                                            recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                                                            if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['buys']):
+                                                                try:
+                                                                    token_info_snapshot = await get_token_info(token_addr)
+                                                                    cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                                                except Exception:
+                                                                    cap_snapshot = None
+                                                                recent_events[token_addr]['buys'].append({"wallet": wallet_address, "amount": abs(sol_change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
+                                                elif sol_change > 0.001:
+                                                    for token_addr, change in changes.items():
+                                                        if change < 0 and token_addr not in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
+                                                            recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                                                            if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['sells']):
+                                                                try:
+                                                                    token_info_snapshot = await get_token_info(token_addr)
+                                                                    cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                                                except Exception:
+                                                                    cap_snapshot = None
+                                                                recent_events[token_addr]['sells'].append({"wallet": wallet_address, "amount": sol_change, "time": event_time, "name": wallet_name, "cap": cap_snapshot})
                                             except Exception:
                                                 pass
                                     # Зафиксировать текущее состояние как "последнее"
@@ -1006,7 +992,8 @@ async def sequential_tracker(chat_id: str, application):
                                         if tx_data is None:
                                             tx_response = await rpc_post(client, tx_payload, timeout=30.0)
                                             if tx_response.status_code == 429:
-                                                logger.warning(f"Rate limited on getTransaction for {wallet_name}, skip sleep.")
+                                                logger.warning(f"Rate limited on getTransaction for {wallet_name}, sleeping for {RATE_LIMIT_SLEEP_SECONDS}s.")
+                                                await asyncio.sleep(RATE_LIMIT_SLEEP_SECONDS)
                                                 continue
                                             tx_data = tx_response.json().get('result')
                                         if not tx_data:
@@ -1049,37 +1036,36 @@ async def sequential_tracker(chat_id: str, application):
                                                 except Exception as e:
                                                     logger.warning(f"Failed to send simple feed message: {e}")
 
-                                            for token_addr, change in changes.items():
-                                                if token_addr in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
-                                                    continue
-                                                if change > 0:
-                                                    recent_events.setdefault(token_addr, {"buys": [], "sells": []})
-                                                    if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['buys']):
-                                                        logger.info(f"BUY EVENT: {wallet_name} bought {token_addr}")
-                                                        try:
-                                                            token_info_snapshot = await get_token_info(token_addr)
-                                                            cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
-                                                        except Exception:
-                                                            cap_snapshot = None
-                                                        recent_events[token_addr]['buys'].append({"wallet": wallet_address, "amount": abs(change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
-                                                elif change < 0:
-                                                    recent_events.setdefault(token_addr, {"buys": [], "sells": []})
-                                                    if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['sells']):
-                                                        logger.info(f"SELL EVENT: {wallet_name} sold {token_addr}")
-                                                        try:
-                                                            token_info_snapshot = await get_token_info(token_addr)
-                                                            cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
-                                                        except Exception:
-                                                            cap_snapshot = None
-                                                        recent_events[token_addr]['sells'].append({"wallet": wallet_address, "amount": abs(change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
+                                            if sol_change < -0.001: # Buy
+                                                for token_addr, change in changes.items():
+                                                    if change > 0 and token_addr not in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
+                                                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                                                        if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['buys']):
+                                                            logger.info(f"BUY EVENT: {wallet_name} bought {token_addr}")
+                                                            try:
+                                                                token_info_snapshot = await get_token_info(token_addr)
+                                                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                                            except Exception:
+                                                                cap_snapshot = None
+                                                            recent_events[token_addr]['buys'].append({"wallet": wallet_address, "amount": abs(sol_change), "time": event_time, "name": wallet_name, "cap": cap_snapshot})
+                                            elif sol_change > 0.001: # Sell
+                                                for token_addr, change in changes.items():
+                                                    if change < 0 and token_addr not in ["So11111111111111111111111111111111111111112", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]:
+                                                        recent_events.setdefault(token_addr, {"buys": [], "sells": []})
+                                                        if not any(e['wallet'] == wallet_address for e in recent_events[token_addr]['sells']):
+                                                            logger.info(f"SELL EVENT: {wallet_name} sold {token_addr}")
+                                                            try:
+                                                                token_info_snapshot = await get_token_info(token_addr)
+                                                                cap_snapshot = token_info_snapshot.get('market_cap') if token_info_snapshot else None
+                                                            except Exception:
+                                                                cap_snapshot = None
+                                                            recent_events[token_addr]['sells'].append({"wallet": wallet_address, "amount": sol_change, "time": event_time, "name": wallet_name, "cap": cap_snapshot})
                                         except Exception as e:
                                             logger.error(f"Error processing transaction {signature} for {wallet_name}: {e}", exc_info=True)
                                     last_sigs_by_wallet[wallet_address] = current_signatures
                     finally:
                         # small pause between wallets
-                        spacing = float(os.getenv("WALLET_SPACING_SECONDS", "0.0"))
-                        if spacing > 0:
-                            await asyncio.sleep(spacing)
+                        await asyncio.sleep(float(os.getenv("WALLET_SPACING_SECONDS", "0.1")))
                         scanned_total += 1
                 
                 # Запускаем обработки пачкой с лимитом одновременности
@@ -1145,6 +1131,8 @@ async def stop_multibuy_tracker(chat_id, context):
     user_session_data['tracking_tasks'] = {}
     logger.info(f"All tracking tasks for chat {chat_id} have been cancelled.")
 
+WINDOW_CHECK_INTERVAL_SECONDS = int(os.getenv("WINDOW_CHECK_INTERVAL_SECONDS", "5"))
+
 async def monitor_for_multievents(chat_id, application):
     """
     This is the central task that periodically checks the collected events 
@@ -1153,7 +1141,7 @@ async def monitor_for_multievents(chat_id, application):
     while True:
         await check_for_multi_events(application, str(chat_id))
         await clean_old_events()
-        await asyncio.sleep(5) # Check for multi-events every 5 seconds 
+        await asyncio.sleep(max(1, WINDOW_CHECK_INTERVAL_SECONDS)) # configurable frequency 
 
 async def cache_cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Periodically remove old cached browser data to avoid disk fill."""
