@@ -263,7 +263,7 @@ async def load_kols_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Request received. Fetching wallets in the background...")
     await query.edit_message_text("⏳ Загружаю KOL-кошельки... пришлю сообщение, когда закончу.")
-    context.application.create_task(_background_load_kols(str(query.message.chat_id), context))
+    context.application.create_task(_background_load_kols(query.message.chat_id, context))
 
 async def _background_load_kols(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     try:
