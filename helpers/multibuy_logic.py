@@ -13,6 +13,8 @@ from html import escape as html_escape
 from time import perf_counter
 from math import ceil
 import re
+import shutil
+import time
 
 # Попытка подключить готовые функции из SolanaTrackerBot (не копируя код)
 ST_WALLET_TRACKER = None
@@ -70,6 +72,13 @@ BIRDEYE_API_KEY = os.getenv("BIRDEYE_API_KEY", "")
 DISCORD_ALLOWED_CHAT_IDS = {s.strip() for s in os.getenv("DISCORD_ALLOWED_CHAT_IDS", "").split(',') if s.strip()}
 DISCORD_DEDUPE_TTL_SECONDS = int(os.getenv("DISCORD_DEDUPE_TTL_SECONDS", "60"))
 _discord_dedupe: dict[str, float] = {}
+# Cache cleanup controls
+CACHE_CLEANUP_ENABLED = os.getenv("CACHE_CLEANUP_ENABLED", "1") == "1"
+CACHE_CLEANUP_TARGETS = [p.strip() for p in os.getenv(
+    "CACHE_CLEANUP_TARGETS",
+    "~/.cache/ms-playwright,~/.local/share/pyppeteer"
+).split(',') if p.strip()]
+CACHE_CLEANUP_MAX_AGE_DAYS = int(os.getenv("CACHE_CLEANUP_MAX_AGE_DAYS", "7"))
 
 # (Удалено) Ранее были флаги SHOW_TOTAL_STATS / SHOW_RECENT_EXITS — больше не используются
 # Они убраны из кода, чтобы сообщение было короче и стабильнее.
@@ -156,68 +165,69 @@ last_signatures = {} # Store last seen signature per wallet
 
 # --- Notification Functions (remains the same) ---
 async def send_discord_message(message, chat_id: str | int = None, dedupe_key: str | None = None):
-	if not DISCORD_WEBHOOK_URL: return
-	# Filter by allowed chat ids if set
-	try:
-		if DISCORD_ALLOWED_CHAT_IDS:
-			cid = str(chat_id) if chat_id is not None else None
-			if cid is None or cid not in DISCORD_ALLOWED_CHAT_IDS:
-				return
-	except Exception:
-		pass
-	# Dedupe
-	try:
-		if dedupe_key:
-			now = perf_counter()
-			ts = _discord_dedupe.get(dedupe_key)
-			if ts and (now - ts) < max(1, DISCORD_DEDUPE_TTL_SECONDS):
-				return
-			_discord_dedupe[dedupe_key] = now
-	except Exception:
-		pass
-	try:
-		async with httpx.AsyncClient() as client:
-			# Convert HTML-ish to Discord-friendly text
-			raw = str(message)
-			# Replace anchor tags with "Text: URL"
-			raw = re.sub(r'<a\s+href=\"([^\"]+)\">([^<]+)</a>', r'\2: \1', raw)
-			# Basic sanitization
-			discord_message = (
-				raw
-				.replace('\n\n', '\n')
-				.replace('<b>', '**').replace('</b>', '**')
-				.replace('<i>', '*').replace('</i>', '*')
-				.replace('<code>', '`').replace('</code>', '`')
-				.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
-			)
-			lines = [l for l in discord_message.split('\n') if l.strip()]
-			title = lines[0][:256] if lines else "Multi Event"
-			description = "\n".join(lines[1:])[:4000] if len(lines) > 1 else ''
-			# Try to set embed.url to Dexscreener link
-			dex_url = None
-			m = re.search(r'https?://[^\s]*dexscreener\.com/\S+', discord_message)
-			if m:
-				dex_url = m.group(0)
-			payload = {
-				"embeds": [
-					{
-						"title": title,
-						"description": description,
-						"color": 0x00C853 if ('Buy' in title or '🔥' in title) else 0xD50000,
-						**({"url": dex_url} if dex_url else {})
-					}
-				]
-			}
-			# Fallback to content if embeds not allowed
-			try:
-				resp = await client.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-				if resp.status_code >= 400:
-					await client.post(DISCORD_WEBHOOK_URL, json={"content": discord_message}, timeout=10)
-			except Exception:
-				await client.post(DISCORD_WEBHOOK_URL, json={"content": discord_message}, timeout=10)
-		logger.info("Discord notification sent.")
-	except Exception as e:
-		logger.error(f"Failed to send Discord message: {e}")
+    if not DISCORD_WEBHOOK_URL:
+        return
+    # Filter by allowed chat ids if set
+    try:
+        if DISCORD_ALLOWED_CHAT_IDS:
+            cid = str(chat_id) if chat_id is not None else None
+            if cid is None or cid not in DISCORD_ALLOWED_CHAT_IDS:
+                return
+    except Exception:
+        pass
+    # Dedupe
+    try:
+        if dedupe_key:
+            now = perf_counter()
+            ts = _discord_dedupe.get(dedupe_key)
+            if ts and (now - ts) < max(1, DISCORD_DEDUPE_TTL_SECONDS):
+                return
+            _discord_dedupe[dedupe_key] = now
+    except Exception:
+        pass
+    try:
+        async with httpx.AsyncClient() as client:
+            # Convert HTML-ish to Discord-friendly text
+            raw = str(message)
+            # Replace anchor tags with "Text: URL"
+            raw = re.sub(r'<a\s+href=\"([^\"]+)\">([^<]+)</a>', r'\2: \1', raw)
+            # Basic sanitization
+            discord_message = (
+                raw
+                .replace('\n\n', '\n')
+                .replace('<b>', '**').replace('</b>', '**')
+                .replace('<i>', '*').replace('</i>', '*')
+                .replace('<code>', '`').replace('</code>', '`')
+                .replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+            )
+            lines = [l for l in discord_message.split('\n') if l.strip()]
+            title = lines[0][:256] if lines else "Multi Event"
+            description = "\n".join(lines[1:])[:4000] if len(lines) > 1 else ''
+            # Try to set embed.url to Dexscreener link
+            dex_url = None
+            m = re.search(r'https?://[^\s]*dexscreener\.com/\S+', discord_message)
+            if m:
+                dex_url = m.group(0)
+            payload = {
+                "embeds": [
+                    {
+                        "title": title,
+                        "description": description,
+                        "color": 0x00C853 if ('Buy' in title or '🔥' in title) else 0xD50000,
+                        **({"url": dex_url} if dex_url else {})
+                    }
+                ]
+            }
+            # Fallback to content if embeds not allowed
+            try:
+                resp = await client.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
+                if resp.status_code >= 400:
+                    await client.post(DISCORD_WEBHOOK_URL, json={"content": discord_message}, timeout=10)
+            except Exception:
+                await client.post(DISCORD_WEBHOOK_URL, json={"content": discord_message}, timeout=10)
+        logger.info("Discord notification sent.")
+    except Exception as e:
+        logger.error(f"Failed to send Discord message: {e}")
 
 
 # Helper to format window label nicely (supports seconds/minutes)
@@ -299,32 +309,32 @@ def format_notification(event_type: str, token_info: dict, participants: list, w
     return "\n".join([l for l in lines if l is not None and l != ""]) 
 
 async def send_notification(context: ContextTypes.DEFAULT_TYPE, message, chat_id: str):
-	# Приведение chat_id к int, если это строка из цифр
-	try:
-		chat_id_cast = int(chat_id) if isinstance(chat_id, str) and chat_id.isdigit() else chat_id
-	except Exception:
-		chat_id_cast = chat_id
-	try:
-		await context.bot.send_message(chat_id=chat_id_cast, text=message, parse_mode='HTML', disable_web_page_preview=True)
-		logger.info(f"Telegram notification sent to chat_id: {chat_id_cast} (HTML)")
-	except Exception as e:
-		logger.warning(f"HTML send failed, retrying MarkdownV2. Err: {e}")
-		try:
-			await context.bot.send_message(chat_id=chat_id_cast, text=message, parse_mode='MarkdownV2')
-			logger.info(f"Telegram notification (MarkdownV2) sent to chat_id: {chat_id_cast}")
-		except Exception as e2:
-			logger.warning(f"MarkdownV2 failed, retrying plain text. Err: {e2}")
-			try:
-				await context.bot.send_message(chat_id=chat_id_cast, text=message)
-				logger.info(f"Telegram notification (plain) sent to chat_id: {chat_id_cast}")
-			except Exception as e3:
-				logger.error(f"Failed to send Telegram message to {chat_id_cast}: {e3}")
-	# Discord forward with dedupe
-	try:
-		key = f"{chat_id}|" + (message.split('\n',1)[0] if isinstance(message, str) else "")
-		await send_discord_message(message, chat_id=str(chat_id_cast), dedupe_key=key)
-	except Exception:
-		pass
+    # Приведение chat_id к int, если это строка из цифр
+    try:
+        chat_id_cast = int(chat_id) if isinstance(chat_id, str) and chat_id.isdigit() else chat_id
+    except Exception:
+        chat_id_cast = chat_id
+    try:
+        await context.bot.send_message(chat_id=chat_id_cast, text=message, parse_mode='HTML', disable_web_page_preview=True)
+        logger.info(f"Telegram notification sent to chat_id: {chat_id_cast} (HTML)")
+    except Exception as e:
+        logger.warning(f"HTML send failed, retrying MarkdownV2. Err: {e}")
+        try:
+            await context.bot.send_message(chat_id=chat_id_cast, text=message, parse_mode='MarkdownV2')
+            logger.info(f"Telegram notification (MarkdownV2) sent to chat_id: {chat_id_cast}")
+        except Exception as e2:
+            logger.warning(f"MarkdownV2 failed, retrying plain text. Err: {e2}")
+            try:
+                await context.bot.send_message(chat_id=chat_id_cast, text=message)
+                logger.info(f"Telegram notification (plain) sent to chat_id: {chat_id_cast}")
+            except Exception as e3:
+                logger.error(f"Failed to send Telegram message to {chat_id_cast}: {e3}")
+    # Discord forward with dedupe
+    try:
+        key = f"{chat_id}|" + (message.split('\n',1)[0] if isinstance(message, str) else "")
+        await send_discord_message(message, chat_id=str(chat_id_cast), dedupe_key=key)
+    except Exception:
+        pass
 
 # --- Data Fetching & Analysis ---
 async def get_token_info(token_address):
@@ -1127,3 +1137,38 @@ async def monitor_for_multievents(chat_id, application):
         await check_for_multi_events(application, str(chat_id))
         await clean_old_events()
         await asyncio.sleep(5) # Check for multi-events every 5 seconds 
+
+async def cache_cleanup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodically remove old cached browser data to avoid disk fill."""
+    if not CACHE_CLEANUP_ENABLED:
+        return
+    removed_bytes = 0
+    now_ts = time.time()
+    max_age = CACHE_CLEANUP_MAX_AGE_DAYS * 86400
+    for raw in CACHE_CLEANUP_TARGETS:
+        try:
+            base = os.path.expanduser(os.path.expandvars(raw))
+            if not os.path.exists(base):
+                continue
+            # Walk and remove entries older than threshold
+            for root, dirs, files in os.walk(base, topdown=False):
+                for name in files:
+                    fp = os.path.join(root, name)
+                    try:
+                        if (now_ts - os.path.getmtime(fp)) > max_age:
+                            removed_bytes += os.path.getsize(fp)
+                            os.remove(fp)
+                    except Exception:
+                        pass
+                for name in dirs:
+                    dp = os.path.join(root, name)
+                    try:
+                        if not os.listdir(dp) or (now_ts - os.path.getmtime(dp)) > max_age:
+                            # remove empty or stale dirs
+                            shutil.rmtree(dp, ignore_errors=True)
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    if removed_bytes > 0:
+        logger.info(f"Cache cleanup removed ~{int(removed_bytes/1024/1024)} MB") 

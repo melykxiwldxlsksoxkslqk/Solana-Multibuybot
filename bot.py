@@ -114,8 +114,17 @@ async def main() -> None:
                 name="kol_auto_refresh",
             )
             logging.info(f"Scheduled kol_auto_refresh job every {interval_seconds} seconds (first run in {first_delay}s)")
+            # Schedule cache cleanup daily
+            from helpers.multibuy_logic import cache_cleanup_job
+            application.job_queue.run_repeating(
+                cache_cleanup_job,
+                interval=24*60*60,
+                first=10,
+                name="cache_cleanup_job",
+            )
+            logging.info("Scheduled cache_cleanup_job daily")
         except Exception as e:
-            logging.error(f"Failed to schedule kol_auto_refresh job: {e}")
+            logging.error(f"Failed to schedule jobs: {e}")
         
         # Keep the script running
         while True:
