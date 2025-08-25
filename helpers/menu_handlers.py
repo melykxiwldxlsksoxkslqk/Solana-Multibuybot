@@ -43,7 +43,22 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
     # Определяем состояние трекинга: либо реальные задачи, либо флаг UI (который ставим сразу при старте)
     user_flag = bool(context.user_data.get('tracking_tasks'))
     is_tracking = bool(runtime_tasks) or user_flag
-    
+
+    # Добавим строку о последнем обновлении KOL
+    last_ts = None
+    try:
+        last_ts = context.application.bot_data.get('kol_last_refresh_ts')
+    except Exception:
+        last_ts = None
+    last_line = ""
+    if isinstance(last_ts, (int, float)) and last_ts:
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromtimestamp(int(last_ts), tz=timezone.utc)
+            last_line = f"\n\nLast KOL refresh: {dt.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+        except Exception:
+            pass
+
     keyboard = [
         [InlineKeyboardButton("Add Wallet Manually", callback_data='add_wallet')],
         [InlineKeyboardButton("Load KOL Wallets", callback_data='load_kols')],
@@ -55,12 +70,14 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, mes
     ]
 
     reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = f"{message}{last_line}"
     
     message_sender = (update.callback_query.message.edit_text if update and update.callback_query 
                       else lambda text, reply_markup: context.bot.send_message(update.effective_chat.id, text, reply_markup=reply_markup))
     
     try:
-        await message_sender(text=message, reply_markup=reply_markup)
+        await message_sender(text=text, reply_markup=reply_markup)
     except BadRequest as e:
         if "Message is not modified" not in str(e):
             logger.error(f"Error updating main menu: {e}")
@@ -221,26 +238,26 @@ async def start_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stop_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE):
-	query = update.callback_query
-	await query.answer()
-	chat_id = str(query.message.chat_id)
-	
-	# Запускаем остановку в фоне, UI обновим сразу
-	context.application.create_task(stop_multibuy_tracker(chat_id, context))
-	# Не удаляем user_data['tracking_tasks'] преждевременно, чтобы кнопка не "скакала"
-	await show_main_menu(update, context, message="🛑 Tracker stopping...")
-	
-	# Дождаться фактической остановки и обновить меню на Start
-	async def _await_stop_and_refresh():
-		for _ in range(40):  # ~20 секунд ожидания
-			runtime_tasks = getattr(context.application, "_runtime_tracking_tasks", {}).get(chat_id, {})
-			if not runtime_tasks and not context.user_data.get('tracking_tasks'):
-				await show_main_menu(update, context, message="🛑 Tracker stopped.")
-				return
-			await asyncio.sleep(0.5)
-		# Таймаут: всё равно попробовать перерисовать
-		await show_main_menu(update, context, message="🛑 Tracker stopped.")
-	context.application.create_task(_await_stop_and_refresh())
+    query = update.callback_query
+    await query.answer()
+    chat_id = str(query.message.chat_id)
+    
+    # Запускаем остановку в фоне, UI обновим сразу
+    context.application.create_task(stop_multibuy_tracker(chat_id, context))
+    # Не удаляем user_data['tracking_tasks'] преждевременно, чтобы кнопка не "скакала"
+    await show_main_menu(update, context, message="🛑 Tracker stopping...")
+    
+    # Дождаться фактической остановки и обновить меню на Start
+    async def _await_stop_and_refresh():
+        for _ in range(40):  # ~20 секунд ожидания
+            runtime_tasks = getattr(context.application, "_runtime_tracking_tasks", {}).get(chat_id, {})
+            if not runtime_tasks and not context.user_data.get('tracking_tasks'):
+                await show_main_menu(update, context, message="🛑 Tracker stopped.")
+                return
+            await asyncio.sleep(0.5)
+        # Таймаут: всё равно попробовать перерисовать
+        await show_main_menu(update, context, message="🛑 Tracker stopped.")
+    context.application.create_task(_await_stop_and_refresh())
 
 async def load_kols_wallets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -277,6 +294,11 @@ async def _background_load_kols(chat_id: int, context: ContextTypes.DEFAULT_TYPE
                 if meta.get('is_tracking') and addr not in used:
                     new_wallets.append({'name': meta.get('name', addr), 'address': addr, 'is_tracking': True})
                     kept += 1
+            # If chat had tracking enabled, optionally auto-track refreshed list
+            had_tracking = bool(context.user_data.get('tracking_tasks'))
+            if had_tracking and os.getenv("KOL_AUTO_TRACK_REFRESH", "1") == "1":
+                for item in new_wallets:
+                    item['is_tracking'] = True
             context.user_data['wallets'] = new_wallets
             total_count = len(new_wallets)
         
@@ -290,6 +312,11 @@ async def _background_load_kols(chat_id: int, context: ContextTypes.DEFAULT_TYPE
             # Сохранить persistence немедленно, если возможно
             try:
                 await context.application.update_persistence()  # PTB v20+
+            except Exception:
+                pass
+            # Отобразить новую метку времени в меню
+            try:
+                await show_main_menu(update=None, context=context, message="Menu updated after KOL sync")
             except Exception:
                 pass
         except Exception:
@@ -331,6 +358,7 @@ async def auto_refresh_kols_for_all_users(context: ContextTypes.DEFAULT_TYPE):
             fresh = [w for w in kols_wallets if w.get('address')]
             total_users = 0
             notify = os.getenv("KOL_AUTO_REFRESH_NOTIFY", "0") == "1"
+            auto_track_refresh = os.getenv("KOL_AUTO_TRACK_REFRESH", "1") == "1"
             for user_id, udata in list(context.application.user_data.items()):
                 try:
                     prev_wallets = udata.get('wallets', []) or []
@@ -349,6 +377,11 @@ async def auto_refresh_kols_for_all_users(context: ContextTypes.DEFAULT_TYPE):
                     for addr, meta in prev_by_addr.items():
                         if meta.get('is_tracking') and addr not in used:
                             new_wallets.append({'name': meta.get('name', addr), 'address': addr, 'is_tracking': True})
+                    # If chat had tracking enabled, optionally auto-track refreshed list
+                    had_tracking = bool(udata.get('tracking_tasks'))
+                    if had_tracking and auto_track_refresh:
+                        for item in new_wallets:
+                            item['is_tracking'] = True
                     udata['wallets'] = new_wallets
                     total_users += 1
                     # Авто‑уведомление (по умолчанию выключено)
@@ -362,7 +395,6 @@ async def auto_refresh_kols_for_all_users(context: ContextTypes.DEFAULT_TYPE):
                                 logger.warning(f"Failed to notify user {user_id} about smart KOL sync: {e}")
                     # Гарантируем, что трекер активен для чата, где был запущен трекинг
                     try:
-                        had_tracking = bool(udata.get('tracking_tasks'))
                         if had_tracking:
                             context.application.create_task(start_multibuy_tracker(str(user_id), context.application))
                     except Exception as e:
